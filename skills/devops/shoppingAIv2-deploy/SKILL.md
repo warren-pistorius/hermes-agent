@@ -22,18 +22,52 @@ Deploys Firebase Cloud Functions for the ShoppingAIv2 (Shopping Mate) app. Two d
 - After pulling changes that modify Cloud Functions
 - After updating `.env` secrets for Firebase Functions
 
+## ⚠️ Environment Confirmation (Critical)
+
+**ALWAYS confirm target environment before deploying.** Stripe live keys in staging = accidentally charging real money. Stripe test keys in production = payments fail silently.
+
+### Required Step: Ask Before Deploying
+```
+Is this a STAGING or PRODUCTION deploy?
+
+- STAGING → Stripe TEST keys (safe, no real charges)
+- PRODUCTION → Stripe LIVE keys (real payments enabled)
+
+Default: staging (safer). Only proceed to production on explicit request.
+```
+
+If user says "deploy", "push", "ship it" without specifying → assume **staging** and confirm.
+
+### Environment Key Differences
+
+| | Staging | Production |
+|--|--|--|
+| Stripe keys | `sk_test_...` (test mode) | `sk_live_...` (real charges) |
+| GA4 | Test property | Live property |
+| `firebase use` alias | `staging` | `production` |
+| `.env` files loaded | `.env` + `.env.staging` | `.env` + `.env.production` |
+
 ## EC2 Deploy (this agent — Warren's EC2 box)
 
 ### Prerequisites
-- Firebase CI token stored at: `~/.hermes/vault/shoppingAIv2/firebase.token`
+- `.env` file exists in `firebase-functions/` (loaded automatically by Firebase CLI)
+- Stripe keys depend on target environment (staging vs production)
 - Active Firebase project: `shoppingai-b9b20`
 
 ### Deploy Command
 ```bash
-cd ~/shoppingAIv2/firebase-functions && \
-FIREBASE_TOKEN="$(cat ~/.hermes/vault/shoppingAIv2/firebase.token)" \
+cd ~/shoppingAIv2/firebase-functions
+firebase use staging  # loads .env + .env.staging (Stripe test keys)
 firebase deploy --only functions --project shoppingai-b9b20
 ```
+
+Or for production:
+```bash
+firebase use production  # loads .env + .env.production (Stripe live keys)
+firebase deploy --only functions --project shoppingai-b9b20
+```
+
+Note: No `FIREBASE_TOKEN` needed — secrets come from `.env` files, not `functions.config()`.
 
 ### Deploy Specific Functions
 ```bash
@@ -119,8 +153,9 @@ firebase use production # loads .env + .env.production (Stripe live keys)
 
 ## Deploy Checklist
 
+- [ ] **Confirm environment: STAGING or PRODUCTION** (ask user if not specified)
 - [ ] Pull latest from `origin/main`
-- [ ] Verify `.env` has all required keys (ANTHROPIC, OPENAI, OPENROUTER, STRIPE keys)
+- [ ] Verify correct `.env` + `.env.{environment}` has all required keys
 - [ ] Run deploy command for target environment
 - [ ] Verify `✔ functions[...] Successful update operation` in output
 - [ ] Check function logs for runtime errors
