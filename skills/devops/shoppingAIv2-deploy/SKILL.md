@@ -67,7 +67,7 @@ firebase use production  # loads .env + .env.production (Stripe live keys)
 firebase deploy --only functions --project shoppingai-b9b20
 ```
 
-Note: No `FIREBASE_TOKEN` needed — secrets come from `.env` files, not `functions.config()`.
+Note: Firebase CLI requires `FIREBASE_TOKEN` (from vault) — gcloud SA is activated but Firebase CLI doesn't use it directly for deploy.
 
 ### Deploy Specific Functions
 ```bash
