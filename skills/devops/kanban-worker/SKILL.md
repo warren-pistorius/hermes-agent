@@ -157,6 +157,51 @@ If you open the task and `kanban_show` returns `runs: [...]` with one or more cl
 - `outcome: "reclaimed"` + `summary: "task archived..."` — operator archived the task out from under the previous run; you probably shouldn't be running at all, check status carefully.
 - `outcome: "blocked"` — a previous attempt blocked; the unblock comment should be in the thread by now.
 
+## Live Board — kanban.pistorius.live
+
+Warren has a live Kanban board at `https://kanban.pistorius.live` tracking Hermes and subagent work in real time. Cards update via SSE without page refresh.
+
+**Credentials:** `warren` / `Wazza` (stored in vault)
+
+**When to create cards:**
+- When you pick up a new piece of work (hermes card)
+- When you spin up a subagent via `delegate_task` (subagent card with the subagent's goal)
+- When a cron job starts significant work
+
+**How to create a card (HTTP from any machine with net access):**
+
+```bash
+# Hermes task
+curl -s -X POST https://kanban.pistorius.live/api/tasks \
+  -u warren:Wazza \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Build user auth flow","column":"backlog","assignee":"hermes"}'
+
+# Subagent task (include goal as subagentGoal)
+curl -s -X POST https://kanban.pistorius.live/api/tasks \
+  -u warren:Wazza \
+  -H "Content-Type: application/json" \
+  -d '{"title":"Review PR #42","column":"backlog","assignee":"subagent","subagentName":"code-review","subagentGoal":"Review shoppingAIv2 PR #42 for auth changes"}'
+```
+
+**Update a card (move to in_progress, done, etc.):**
+
+```bash
+# Move to in_progress
+curl -s -X PUT https://kanban.pistorius.live/api/tasks/<id> \
+  -u warren:Wazza -H "Content-Type: application/json" \
+  -d '{"column":"in_progress"}'
+
+# Move to done
+curl -s -X PUT https://kanban.pistorius.live/api/tasks/<id> \
+  -u warren:Wazza -H "Content-Type: application/json" \
+  -d '{"column":"done"}'
+```
+
+**Delete a card:** `DELETE /api/tasks/<id>`
+
+**Columns:** `backlog` | `in_progress` | `in_review` | `done`
+
 ## Do NOT
 
 - Call `delegate_task` as a substitute for `kanban_create`. `delegate_task` is for short reasoning subtasks inside YOUR run; `kanban_create` is for cross-agent handoffs that outlive one API loop.
