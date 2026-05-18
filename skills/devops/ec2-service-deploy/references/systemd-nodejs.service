@@ -1,0 +1,38 @@
+# systemd service template for Node.js on Warren's EC2
+#
+# Variables to replace:
+#   <SERVICE>       — e.g. kanban-api
+#   <DESCRIPTION>   — e.g. Hermes Kanban API Server
+#   <WORKDIR>       — e.g. /home/ubuntu/kanban
+#   <EXEC>          — absolute path to node binary
+#
+# Important:
+#   - Use ABSOLUTE path to node (systemd PATH ≠ user PATH)
+#   - Include PATH env var so subprocesses find node
+#   - ProtectHome=read-only (NOT true) — allows home reads but still restricts
+#   - ReadWritePaths must list any dirs the service writes to
+
+[Unit]
+Description=<DESCRIPTION>
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+Environment="PATH=/home/ubuntu/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+WorkingDirectory=<WORKDIR>
+ExecStart=<EXEC>
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=<WORKDIR>
+
+[Install]
+WantedBy=multi-user.target
