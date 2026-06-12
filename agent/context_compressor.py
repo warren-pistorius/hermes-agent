@@ -69,6 +69,16 @@ SUMMARY_PREFIX = (
 )
 LEGACY_SUMMARY_PREFIX = "[CONTEXT SUMMARY]:"
 
+# Appended to every standalone summary message (and to the merged-into-tail
+# prefix) so the model has an unambiguous "summary ends here" boundary.
+# Without it, weak models read the verbatim "## Active Task" quote as fresh
+# user input (#11475, #14521) or regurgitate an assistant-role summary as
+# their own output (#33256).
+_SUMMARY_END_MARKER = (
+    "--- END OF CONTEXT SUMMARY — "
+    "respond to the message below, not the summary above ---"
+)
+
 # Handoff prefixes that shipped in earlier releases. A summary persisted under
 # one of these can be inherited into a resumed lineage (#35344); when it is
 # re-normalized on re-compaction we must strip the OLD prefix too, otherwise the
@@ -143,9 +153,17 @@ _SUMMARY_FAILURE_COOLDOWN_SECONDS = 600
 # become another unbounded transcript copy after the LLM summarizer failed.
 _FALLBACK_SUMMARY_MAX_CHARS = 8_000
 _FALLBACK_TURN_MAX_CHARS = 700
+_AUTO_FOCUS_MAX_TURNS = 3
+_AUTO_FOCUS_TURN_MAX_CHARS = 260
+_AUTO_FOCUS_MAX_CHARS = 700
 
 
 _PATH_MENTION_RE = re.compile(r"(?:/|~/?|[A-Za-z]:\\)[^\s`'\")\]}<>]+")
+
+# MEDIA delivery directives must not reach the summarizer — if one leaks into
+# the summary, the downstream model may re-emit it as an active directive on
+# the next turn, triggering bogus attachment sends (#14665).
+_MEDIA_DIRECTIVE_RE = re.compile(r"MEDIA:\S+")
 
 
 def _dedupe_append(items: list[str], value: str, *, limit: int) -> None:
@@ -1007,6 +1025,7 @@ class ContextCompressor(ContextEngine):
         for msg in turns:
             role = msg.get("role", "unknown")
             content = redact_sensitive_text(msg.get("content") or "")
+            content = _MEDIA_DIRECTIVE_RE.sub("[media attachment]", content)
 
             # Tool results: keep enough content for the summarizer
             if role == "tool":
@@ -1454,7 +1473,7 @@ Use this exact structure:
             prompt += f"""
 
 FOCUS TOPIC: "{focus_topic}"
-The user has requested that this compaction PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
+This compaction should PRIORITISE preserving all information related to the focus topic above. For content related to "{focus_topic}", include full detail — exact values, file paths, command outputs, error messages, and decisions. For content NOT related to the focus topic, summarise more aggressively (brief one-liners or omit if truly irrelevant). The focus topic sections should receive roughly 60-70% of the summary token budget. Even for the focus topic, NEVER preserve API keys, tokens, passwords, or credentials — use [REDACTED]."""
 
         try:
             call_kwargs = {
@@ -1607,7 +1626,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         text = (summary or "").strip()
         for prefix in (SUMMARY_PREFIX, LEGACY_SUMMARY_PREFIX, *_HISTORICAL_SUMMARY_PREFIXES):
             if text.startswith(prefix):
-                return text[len(prefix):].lstrip()
+                text = text[len(prefix):].lstrip()
+                break
+        # Strip the trailing end marker too — a rehydrated handoff body that
+        # keeps it would leak the boundary directive into the iterative-update
+        # summarizer prompt (and the marker is re-appended on insertion anyway).
+        if text.endswith(_SUMMARY_END_MARKER):
+            text = text[: -len(_SUMMARY_END_MARKER)].rstrip()
         return text
 
     @classmethod
@@ -1622,6 +1647,39 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         if text.startswith(SUMMARY_PREFIX) or text.startswith(LEGACY_SUMMARY_PREFIX):
             return True
         return any(text.startswith(p) for p in _HISTORICAL_SUMMARY_PREFIXES)
+
+    @classmethod
+    def _derive_auto_focus_topic(
+        cls,
+        messages: List[Dict[str, Any]],
+    ) -> Optional[str]:
+        """Infer a compact focus hint from the most recent real user turns."""
+        candidates: list[str] = []
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if cls._is_context_summary_content(content):
+                continue
+            text = redact_sensitive_text(_content_text_for_contains(content).strip())
+            if not text:
+                continue
+            text = " ".join(text.split())
+            if len(text) > _AUTO_FOCUS_TURN_MAX_CHARS:
+                text = text[: _AUTO_FOCUS_TURN_MAX_CHARS - 1].rstrip() + "…"
+            candidates.append(text)
+            if len(candidates) >= _AUTO_FOCUS_MAX_TURNS:
+                break
+
+        if not candidates:
+            return None
+
+        candidates.reverse()
+        focus = "Recent user focus:\n" + "\n".join(f"- {item}" for item in candidates)
+        if len(focus) > _AUTO_FOCUS_MAX_CHARS:
+            focus = focus[: _AUTO_FOCUS_MAX_CHARS - 1].rstrip() + "…"
+        return focus
 
     @classmethod
     def _find_latest_context_summary(
@@ -1775,6 +1833,105 @@ The user has requested that this compaction PRIORITISE preserving all informatio
                 return i
         return -1
 
+    def _find_last_assistant_message_idx(
+        self, messages: List[Dict[str, Any]], head_end: int
+    ) -> int:
+        """Return the index of the last user-visible assistant reply at or
+        after *head_end*, or -1.
+
+        A "user-visible reply" is an assistant message with non-empty
+        textual content — i.e. one that the WebUI / TUI / SessionsPage
+        rendered as a bubble the operator could read. We deliberately
+        skip assistant messages that contain only ``tool_calls`` (and
+        no text), because those render as small "calling tool X"
+        indicators and aren't what the reporter means by "the output
+        of the last message you sent" (#29824).
+
+        Falling back to the most recent assistant message of ANY kind
+        only kicks in when no content-bearing assistant message exists
+        in the compressible region — typically a fresh session that
+        just started a multi-step tool sequence with no prior reply
+        to anchor. In that case the agent fix is a no-op and the
+        existing user-message anchor carries the load.
+        """
+        last_any = -1
+        for i in range(len(messages) - 1, head_end - 1, -1):
+            msg = messages[i]
+            if msg.get("role") != "assistant":
+                continue
+            if last_any < 0:
+                last_any = i
+            content = msg.get("content")
+            if isinstance(content, str) and content.strip():
+                return i
+            if isinstance(content, list):
+                # Multimodal / Anthropic-style content: look for any
+                # text block with non-empty text.
+                for part in content:
+                    if isinstance(part, dict):
+                        text = part.get("text") or part.get("content")
+                        if isinstance(text, str) and text.strip():
+                            return i
+        return last_any
+
+    def _ensure_last_assistant_message_in_tail(
+        self,
+        messages: List[Dict[str, Any]],
+        cut_idx: int,
+        head_end: int,
+    ) -> int:
+        """Guarantee the most recent assistant message is in the protected tail.
+
+        WebUI / TUI / SessionsPage bug (#29824). Without this anchor,
+        ``_find_tail_cut_by_tokens`` can leave the user's most recent
+        visible assistant response inside the compressed middle region —
+        especially when the conversation has a single oversized tool
+        result or a long stretch of tool-call/result pairs after the
+        last assistant reply. The summariser then rolls that reply up
+        into the single ``[CONTEXT COMPACTION — REFERENCE ONLY]`` block
+        persisted as ``role="user"`` or ``role="assistant"``. From the
+        operator's perspective the WebUI session viewer
+        (``web/src/pages/SessionsPage.tsx``) and the TUI chat panel
+        both suddenly show the opaque "Context compaction" block in the
+        slot where they were just reading the assistant's actual reply:
+
+            User:       "i cant see the output of the last message you
+                         sent, i did see it previously, however now see
+                         'context compaction'"
+
+        Mirror of ``_ensure_last_user_message_in_tail`` but anchors on
+        the last assistant-role message. Re-runs the tool-group
+        alignment so we don't split a ``tool_call`` / ``tool_result``
+        group that immediately precedes the anchored message — orphaned
+        tool messages would otherwise be removed by
+        ``_sanitize_tool_pairs`` and trigger the same data-loss symptom
+        we're trying to prevent.
+        """
+        last_asst_idx = self._find_last_assistant_message_idx(messages, head_end)
+        if last_asst_idx < 0:
+            # No assistant message in the compressible region — nothing
+            # to anchor (single-turn pre-reply state, etc.).
+            return cut_idx
+        if last_asst_idx >= cut_idx:
+            # Already in the tail — the token-budget walk did the right
+            # thing on its own.
+            return cut_idx
+        # Pull cut_idx back to the assistant message, then re-align so
+        # we don't split a tool group that immediately precedes it
+        # (e.g. an ``assistant(tool_calls)`` → ``tool(result)`` →
+        # ``assistant(final reply)`` sequence would otherwise leave the
+        # ``tool`` orphan when cut lands at the final reply).
+        new_cut = self._align_boundary_backward(messages, last_asst_idx)
+        if not self.quiet_mode:
+            logger.debug(
+                "Anchoring tail cut to last assistant message at index %d "
+                "(was %d, aligned to %d) to keep the previously-visible "
+                "reply out of the compaction summary (#29824)",
+                last_asst_idx, cut_idx, new_cut,
+            )
+        # Safety: never go back into the head region.
+        return max(new_cut, head_end + 1)
+
     def _ensure_last_user_message_in_tail(
         self,
         messages: List[Dict[str, Any]],
@@ -1917,6 +2074,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         # Ensure the most recent user message is always in the tail so the
         # active task is never lost to compression (fixes #10896).
         cut_idx = self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
+
+        # Ensure the most recent assistant message is always in the tail
+        # so the previously-visible reply isn't silently rolled into the
+        # ``[CONTEXT COMPACTION — REFERENCE ONLY]`` block (fixes #29824).
+        # Each anchor only walks ``cut_idx`` backward, so chaining them is
+        # monotonic — the tail can only grow, never shrink.
+        cut_idx = self._ensure_last_assistant_message_in_tail(messages, cut_idx, head_end)
 
         return max(cut_idx, head_end + 1)
 
@@ -2070,7 +2234,8 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             )
 
         # Phase 3: Generate structured summary
-        summary = self._generate_summary(turns_to_summarize, focus_topic=focus_topic)
+        summary_focus_topic = focus_topic or self._derive_auto_focus_topic(messages)
+        summary = self._generate_summary(turns_to_summarize, focus_topic=summary_focus_topic)
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
@@ -2150,15 +2315,13 @@ The user has requested that this compaction PRIORITISE preserving all informatio
 
         # When the summary lands as a standalone role="user" message,
         # weak models read the verbatim "## Active Task" quote of a past
-        # user request as fresh input (#11475, #14521). Append the explicit
-        # end marker — the same one used in the merge-into-tail path — so
-        # the model has a clear "summary above, not new input" signal.
-        if not _merge_summary_into_tail and summary_role == "user":
-            summary = (
-                summary
-                + "\n\n--- END OF CONTEXT SUMMARY — "
-                "respond to the message below, not the summary above ---"
-            )
+        # user request as fresh input (#11475, #14521).
+        # When it lands as role="assistant", models may regurgitate the
+        # summary text as their own output (#33256). In both cases, append
+        # the explicit end marker so the model has a clear "summary ends
+        # here, respond to the message below" signal.
+        if not _merge_summary_into_tail:
+            summary = summary + "\n\n" + _SUMMARY_END_MARKER
 
         if not _merge_summary_into_tail:
             compressed.append({"role": summary_role, "content": summary})
@@ -2166,11 +2329,7 @@ The user has requested that this compaction PRIORITISE preserving all informatio
         for i in range(compress_end, n_messages):
             msg = messages[i].copy()
             if _merge_summary_into_tail and i == compress_end:
-                merged_prefix = (
-                    summary
-                    + "\n\n--- END OF CONTEXT SUMMARY — "
-                    "respond to the message below, not the summary above ---\n\n"
-                )
+                merged_prefix = summary + "\n\n" + _SUMMARY_END_MARKER + "\n\n"
                 msg["content"] = _append_text_to_content(
                     msg.get("content"),
                     merged_prefix,
